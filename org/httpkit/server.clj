@@ -1,0 +1,188 @@
+(ns org.httpkit.server
+  (:import [org.httpkit.server AsyncChannel HttpServer RingHandler ProxyProtocolOption]
+           javax.xml.bind.DatatypeConverter
+           java.security.MessageDigest))
+
+;;;; Ring server
+
+(defn run-server
+  "Starts HTTP server and returns
+    (fn [& {:keys [timeout] ; Timeout (msecs) to wait on existing reqs to complete
+           :or   {timeout 100}}])
+
+  Server is mostly Ring compatible, see http://http-kit.org/migration.html
+  for differences.
+
+  Options:
+    :ip                 ; Which ip (if has many ips) to bind
+    :port               ; Which port listen incomming request
+    :thread             ; Http worker thread count
+    :queue-size         ; Max job queued before reject to project self
+    :max-body           ; Max http body: 8m
+    :max-ws             ; Max websocket message size
+    :max-line           ; Max http inital line length
+    :proxy-protocol     ; Proxy protocol e/o #{:disable :enable :optional}
+    :worker-name-prefix ; Woker thread name prefix"
+
+  [handler
+   & [{:keys [ip port thread queue-size max-body max-ws max-line
+              proxy-protocol worker-name-prefix]
+
+       :or   {ip         "0.0.0.0"
+              port       8090
+              thread     4
+              queue-size 20480
+              max-body   8388608
+              max-ws     4194304
+              max-line   4096
+              proxy-protocol :disable
+              worker-name-prefix "worker-"}}]]
+
+  (let [h (RingHandler. thread handler worker-name-prefix queue-size)
+        proxy-enum (case proxy-protocol
+                     :enable   ProxyProtocolOption/ENABLED
+                     :disable  ProxyProtocolOption/DISABLED
+                     :optional ProxyProtocolOption/OPTIONAL)
+
+        s (HttpServer. ip port h max-body max-line max-ws proxy-enum)]
+
+    (.start s)
+    (with-meta
+      (fn stop-server [& {:keys [timeout] :or {timeout 100}}]
+        ;; graceful shutdown:
+        ;; 1. server stop accept new request
+        ;; 2. wait for existing requests to finish
+        ;; 3. close the server
+        (.stop s timeout))
+
+      {:local-port (.getPort s)
+       :server s})))
+
+;;;; Asynchronous extension
+
+(defprotocol Channel
+  "Unified asynchronous channel interface for HTTP (streaming or long-polling)
+   and WebSocket."
+
+  (open? [ch] "Returns true iff channel is open.")
+  (close [ch]
+    "Closes the channel. Idempotent: returns true if the channel was actually
+    closed, or false if it was already closed.")
+  (websocket? [ch] "Returns true iff channel is a WebSocket.")
+  (send! [ch data] [ch data close-after-send?]
+    "Sends data to client and returns true if the data was successfully sent,
+    or false if the channel is closed. Data is sent directly to the client,
+    NO RING MIDDLEWARE IS APPLIED.
+
+    When unspecified, `close-after-send?` defaults to true for HTTP channels
+    and false for WebSocket.
+
+    Data form: {:headers _ :status _ :body _} or just body. Note that :headers
+    and :status will be stripped for WebSocket and for HTTP streaming responses
+    after the first.
+
+    For WebSocket, a text frame is sent to client if data is String,
+    a binary frame when data is byte[] or InputStream. For for HTTP streaming
+    responses, data can be one of the type defined by Ring spec")
+  (on-receive [ch callback]
+    "Sets handler (fn [message]) for notification of client WebSocket
+    messages. Message ordering is guaranteed by server.
+
+    The message argument could be a string or a byte[].")
+  (on-close [ch callback]
+    "Sets handler (fn [status]) for notification of channel being closed by the
+    server or client. Handler will be invoked at most once. Useful for clean-up.
+
+    Callback status argument:
+      :server-close   : Channel closed by sever
+      :client-close   : HTTP channel closed by client
+      :normal         : WebSocket closed by client (CLOSE_NORMAL)
+      :going-away     : WebSocket closed by client (CLOSE_GOING_AWAY)
+      :protocol-error : WebSocket closed by client (CLOSE_PROTOCOL_ERROR)
+      :unsupported    : WebSocket closed by client (CLOSE_UNSUPPORTED)
+      :unknown        : WebSocket closed by client (unknown reason)"))
+
+(extend-type AsyncChannel
+  Channel
+  (open? [ch] (not (.isClosed ch)))
+  (close [ch] (.serverClose ch 1000))
+  (websocket? [ch] (.isWebSocket ch))
+  (send!
+    ([ch data] (.send ch data (not (websocket? ch))))
+    ([ch data close-after-send?] (.send ch data (boolean close-after-send?))))
+  (on-receive [ch callback] (.setReceiveHandler ch callback))
+  (on-close [ch callback] (.setCloseHandler ch callback)))
+
+;;;; WebSocket
+
+(defn sec-websocket-accept [sec-websocket-key]
+  (let [md (MessageDigest/getInstance "SHA1")
+        websocket-13-guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"]
+    (DatatypeConverter/printBase64Binary
+      (.digest md (.getBytes (str sec-websocket-key websocket-13-guid))))))
+
+(def accept "DEPRECATED for `sec-websocket-accept" sec-websocket-accept)
+
+(defn send-websocket-handshake!
+  "Returns true iff successfully upgraded a valid WebSocket request."
+  [^AsyncChannel ch ring-req]
+  (when-let [sec-ws-key (get-in ring-req [:headers "sec-websocket-key"])]
+    (when-let [sec-ws-accept (try (sec-websocket-accept sec-ws-key)
+                                  (catch Exception _))]
+      (.sendHandshake ch
+        {"Upgrade" "websocket"
+         "Connection" "Upgrade"
+         "Sec-WebSocket-Accept" sec-ws-accept})
+      true)))
+
+;; (defn websocket-req? [ring-req] (:websocket?    ring-req))
+;; (defn async-channel  [ring-req] (:async-channel ring-req))
+;; (defn async-response [ring-req] {:body (:async-channel ring-req)})
+
+(defmacro with-channel
+  "Evaluates body with `ch-name` bound to the request's underlying
+  asynchronous HTTP or WebSocket channel, and returns {:body AsyncChannel}
+  as an implementation detail.
+
+  ;; Asynchronous HTTP response (with optional streaming)
+  (defn my-async-handler [request]
+    (with-channel request ch ; Request's channel
+      ;; Make ch available to whoever can deliver the response to it; ex.:
+      (swap! clients conj ch)))   ; given (def clients (atom #{}))
+  ;; Some place later:
+  (doseq [ch @clients]
+    (swap! clients disj ch)
+    (send! ch {:status  200
+                 :headers {\"Content-Type\" \"text/html\"}
+                 :body your-async-response}
+             ;; false ; Uncomment to use chunk encoding for HTTP streaming
+             )))
+
+  ;; WebSocket response
+  (defn my-chatroom-handler [request]
+    (if-not (:websocket? request)
+      {:status 200 :body \"Welcome to the chatroom! JS client connecting...\"}
+      (with-channel request ch
+        (println \"New WebSocket channel:\" ch)
+        (on-receive ch (fn [msg]    (println \"on-receive:\" msg)))
+        (on-close   ch (fn [status] (println \"on-close:\" status)))
+        (send! ch \"First chat message!\"))))
+
+  Channel API (see relevant docstrings for more info):
+    (open? [ch])
+    (close [ch])
+    (websocket? [ch])
+    (send! [ch data] [ch data close-after-send?])
+    (on-receieve [ch callback])
+    (on-close [ch callback])
+
+  See org.httpkit.timer ns for optional timeout facilities."
+  [ring-req ch-name & body]
+  `(let [ring-req# ~ring-req
+         ~ch-name (:async-channel ring-req#)]
+
+     (if (:websocket? ring-req#)
+       (if (send-websocket-handshake! ~ch-name ring-req#)
+         (do ~@body {:body ~ch-name})
+         {:status 400 :body "Bad Sec-WebSocket-Key header"})
+       (do ~@body {:body ~ch-name}))))
